@@ -16,6 +16,7 @@ def sync_image_to_hosts(
     hosts: list[str],
     ssh_user: str | None = None,
     ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
     dry_run: bool = False,
     force_pull: bool = False,
 ) -> list[str]:
@@ -50,5 +51,6 @@ def sync_image_to_hosts(
         "Image",
         ssh_user=ssh_user,
         ssh_key=ssh_key,
+        ssh_options=ssh_options,
         dry_run=dry_run,
     )
