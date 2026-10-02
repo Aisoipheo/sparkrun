@@ -371,18 +371,34 @@ def test_save_job_metadata_writes_where_o_nofollow_is_unavailable(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
+def _stub_local_executor_idle(monkeypatch):
+    """Report the local executor's hosts reachable-and-idle.
+
+    The sweep merges every host-scope executor, so an unstubbed one's real
+    SSH attempt at a fabricated host lands in ``ClusterStatus.errors`` — and
+    an error or an *absent* host both read as "status unavailable" on the
+    read side, not as what these tests are about.
+    """
+    from sparkrun.core.cluster_status import empty_status
+    from sparkrun.orchestration.executors.local import LocalExecutor
+
+    monkeypatch.setattr(LocalExecutor, "query_status", lambda self, hosts, **kw: empty_status(list(hosts), executor="local"))
+
+
 def test_api_stop_recipe_path_raises_job_not_found_on_zero_matches(tmp_path, intent_recipe, monkeypatch):
     """No workloads running matching the intent → JobNotFound (not Ambiguous)."""
     import sparkrun.api as api
-    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.cluster_status import empty_status
 
-    # Stub executor.query_status to return an empty snapshot.
+    # Both host-scope executors must report the host reachable (idle) — see
+    # _stub_local_executor_idle for why "absent" would read as "unavailable".
     def fake_query_status(self, hosts, **kw):
-        return ClusterStatus(hosts=(), executor="docker")
+        return empty_status(list(hosts), executor="docker")
 
     from sparkrun.orchestration.executors.docker import DockerExecutor
 
     monkeypatch.setattr(DockerExecutor, "query_status", fake_query_status)
+    _stub_local_executor_idle(monkeypatch)
 
     with pytest.raises(api.JobNotFound):
         api.stop(recipe=intent_recipe, hosts=("h1",), cache_dir=str(tmp_path))
@@ -439,6 +455,7 @@ def test_api_stop_recipe_path_succeeds_on_single_match(tmp_path, intent_recipe, 
     from sparkrun.orchestration.executors.docker import DockerExecutor
 
     monkeypatch.setattr(DockerExecutor, "query_status", fake_query_status)
+    _stub_local_executor_idle(monkeypatch)
 
     # Stub cleanup to short-circuit the actual SSH dispatch.
     def fake_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None):
