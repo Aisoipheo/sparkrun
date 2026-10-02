@@ -1403,15 +1403,8 @@ def _distribute_single_model(
     # skipped entirely, and the distributing source is verified before
     # anything pushes from it: one raced transfer must not become every
     # node's problem.  SPARKRUN_NO_MODEL_VERIFY=1 switches this off.
-    from sparkrun.models.download import is_gguf_model
-    from sparkrun.models.verify import model_verify_disabled
-
     if _preflight_applicable(model, transfer_mode, dry_run, _preflight_done):
-        from sparkrun.models.verify import (
-            repair_model_on_host,
-            verify_model_local,
-            verify_model_on_hosts,
-        )
+        from sparkrun.models.verify import verify_model_on_hosts
 
         bad = verify_model_on_hosts(
             model,

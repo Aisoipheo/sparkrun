@@ -11,7 +11,7 @@ import pytest
 import sparkrun.models.distribute as distribute_mod
 import sparkrun.models.download as download_mod
 import sparkrun.models.verify as verify_mod
-from sparkrun.models.verify import render_verify_script, verify_model_local
+from sparkrun.models.verify import VERIFY_MARKER_NAME, render_verify_script, verify_model_local
 from sparkrun.orchestration.distribution import ModelDistributionPrefs, _distribute_single_model
 
 
@@ -105,6 +105,16 @@ def test_render_verify_script_has_no_stray_braces():
     script = render_verify_script("org/name", "~/.cache/huggingface", "cafe1234")
     assert "{" not in script and "}" not in script
     assert "cafe1234" in script
+
+
+def test_marker_name_matches_python_constant():
+    """Drift guard (CX7_NETPLAN_FILE precedent): the script hardcodes the
+    marker name bash-side; keep it glued to VERIFY_MARKER_NAME so the two
+    sides can never disagree about where the marker lives."""
+    import sparkrun.scripts as scripts_pkg
+
+    src = (Path(scripts_pkg.__file__).parent / "model_verify.sh").read_text()
+    assert 'MARKER="$CACHE_PATH/%s"' % VERIFY_MARKER_NAME in src
 
 
 # ---------------------------------------------------------------------------

@@ -18,9 +18,7 @@ _VANISHED = (
 
 # rc=24 without the marker: nothing identifies vanished files, so a blind
 # retry could churn on a failure no re-walk can fix.
-_UNMARKED_RC24 = (
-    "rsync error: some files/attrs were not transferred (code 24) at main.c(1338) [sender=3.2.7]\n"
-)
+_UNMARKED_RC24 = "rsync error: some files/attrs were not transferred (code 24) at main.c(1338) [sender=3.2.7]\n"
 
 
 def _res(rc: int, stderr: str = "") -> RemoteResult:
