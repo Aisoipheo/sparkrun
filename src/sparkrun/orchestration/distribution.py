@@ -1228,6 +1228,26 @@ def _distribute_single_image(
     return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, force_pull=force_pull, **ssh_kwargs)
 
 
+def _preflight_applicable(model: str, transfer_mode: str, dry_run: bool, done: bool) -> bool:
+    """True when this launch should verify caches before distributing.
+
+    rsync-carrying modes only -- ``pull`` already ensures per node, and GGUF
+    caches lack the blob-hash layout the verifier relies on.  *done*
+    (``_preflight_done``) is the recursion guard: the re-dispatches below
+    must not verify twice.
+    """
+    from sparkrun.models.download import is_gguf_model
+    from sparkrun.models.verify import model_verify_disabled
+
+    return (
+        not done
+        and not dry_run
+        and transfer_mode in ("local", "push", "delegated")
+        and not is_gguf_model(model)
+        and not model_verify_disabled()
+    )
+
+
 def _redistribute_after_preflight(
     *,
     model: str,
@@ -1242,7 +1262,6 @@ def _redistribute_after_preflight(
     revision: str | None,
     hf_token: str | None,
     dry_run: bool,
-    auto_delegated: bool,
     prefs: "ModelDistributionPrefs",
 ) -> list["TransferFailure"]:
     """Route distribution to exactly the hosts that failed pre-flight.
@@ -1293,8 +1312,9 @@ def _redistribute_after_preflight(
                 revision,
                 hf_token,
                 dry_run,
-                auto_delegated,
+                False,  # dispatch-local: this recursion is only reached for local/push, whose dispatch never reads it
                 prefs,
+                # Recursion guard: _preflight_applicable() must not run again.
                 _preflight_done=True,
             )
 
@@ -1375,13 +1395,7 @@ def _distribute_single_model(
     from sparkrun.models.download import is_gguf_model
     from sparkrun.models.verify import model_verify_disabled
 
-    if (
-        not _preflight_done
-        and not dry_run
-        and transfer_mode in ("local", "push", "delegated")
-        and not is_gguf_model(model)
-        and not model_verify_disabled()
-    ):
+    if _preflight_applicable(model, transfer_mode, dry_run, _preflight_done):
         from sparkrun.models.verify import (
             repair_model_on_host,
             verify_model_local,
@@ -1416,7 +1430,6 @@ def _distribute_single_model(
             revision=revision,
             hf_token=hf_token,
             dry_run=dry_run,
-            auto_delegated=auto_delegated,
             prefs=prefs,
         )
 

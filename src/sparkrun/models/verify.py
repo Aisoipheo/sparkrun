@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # models).  NVMe sustains well over 1 GB/s of sha256; slow disks need room.
 DEFAULT_VERIFY_TIMEOUT = 1800
 
+# Written next to a model's cache after a clean hash pass; a marker younger
+# than every weight blob short-circuits the next verification (see
+# ``verify_model_local`` and the matching fast path in ``model_verify.sh``).
+VERIFY_MARKER_NAME = ".sparkrun-verified"
+
 # Weight patterns mirror model_sync.sh / is_model_cached.  Only weight blobs
 # are hashed: they are the LFS files whose names are sha256 digests, and they
 # are the payload a raced transfer actually damages.
@@ -37,7 +42,12 @@ def model_verify_disabled() -> bool:
 
 
 def _weight_files(snapshots: Path, revision: str | None):
-    """Yield weight-file paths under the revision's snapshot directories."""
+    """Yield weight-file paths under the revision's snapshot directories.
+
+    Recursive (``rglob``), mirroring the remote scan: some repos shard their
+    weights into a subdirectory, and a top-level-only glob would report those
+    caches as unverified and trigger downloads they don't need.
+    """
     model_cache = snapshots.parent
     if revision:
         dirs = _snapshot_dirs_for_revision(model_cache, snapshots, revision)
@@ -47,7 +57,7 @@ def _weight_files(snapshots: Path, revision: str | None):
             dirs = [d for d in snapshots.iterdir() if d.is_dir()] if snapshots.is_dir() else []
     for d in dirs:
         for pattern in _WEIGHT_PATTERNS:
-            for f in sorted(d.glob(pattern)):
+            for f in sorted(d.rglob(pattern)):
                 if f.is_file():  # follows the symlink; dangling entries are skipped by callers' checks
                     yield f
 
@@ -59,19 +69,33 @@ def verify_model_local(model_id: str, cache_dir: str | None = None, revision: st
     revision), otherwise the list of corrupt/missing weight blobs — empty when
     the cache verifies.  GGUF caches have a different layout and are not
     verified here (callers exclude them upstream of this module).
+
+    Steady-state fast path: a verification marker younger than every weight
+    blob short-circuits the hash pass, so repeat launches don't re-hash
+    hundreds of gigabytes.  Any blob written after the last clean pass (fresh
+    mtime — downloads and re-downloads alike) invalidates the marker.
     """
     if is_gguf_model(model_id):
         return []
     cache = Path(resolve_hf_cache_home(cache_dir))
     safe_name = model_id.replace("/", "--")
-    snapshots = cache / "hub" / f"models--{safe_name}" / "snapshots"
+    model_cache = cache / "hub" / f"models--{safe_name}"
+    snapshots = model_cache / "snapshots"
     if not snapshots.is_dir():
         return None
 
+    weights = list(_weight_files(snapshots, revision))
+    if not weights:
+        return None
+    marker = model_cache / VERIFY_MARKER_NAME
+    try:
+        if marker.is_file() and all(p.stat().st_mtime <= marker.stat().st_mtime for p in weights):
+            return []
+    except OSError:
+        pass
+
     bad: list[Path] = []
-    found = 0
-    for f in _weight_files(snapshots, revision):
-        found += 1
+    for f in weights:
         blob = f.resolve()
         if not blob.is_file():
             logger.warning("missing blob for snapshot entry: %s", f)
@@ -84,8 +108,11 @@ def verify_model_local(model_id: str, cache_dir: str | None = None, revision: st
         if h.hexdigest() != blob.name:
             logger.warning("checksum mismatch: %s", blob)
             bad.append(blob)
-    if found == 0:
-        return None
+    if not bad:
+        try:
+            marker.touch()
+        except OSError:
+            pass
     return bad
 
 
@@ -135,8 +162,17 @@ def verify_model_on_hosts(
         ssh_options=ssh_options,
         timeout=timeout,
         quiet=True,
+        allow_local=True,
+        session_guard=True,
     )
-    return [r.host for r in results if not r.success]
+    failed = [r for r in results if not r.success]
+    for r in failed:
+        # The script echoes the offending blob names; surface them instead of
+        # leaving the operator a bare "failed on N hosts".
+        detail = ((r.stdout or "") + (r.stderr or "")).strip()
+        if detail:
+            logger.warning("Model verification on %s reported:\n%s", r.host, detail[-1500:])
+    return [r.host for r in failed]
 
 
 def repair_model_on_host(
@@ -161,18 +197,18 @@ def repair_model_on_host(
     from sparkrun.models.distribute import _build_model_ensure_script
     from sparkrun.orchestration.ssh import run_script_on_host
 
-    kw = dict(ssh_user=ssh_user, ssh_key=ssh_key, ssh_options=ssh_options)
+    kw = dict(ssh_user=ssh_user, ssh_key=ssh_key, ssh_options=ssh_options, session_guard=True)
     cache = resolve_hf_cache_home(cache_dir)
 
     verify = "export SPARKRUN_VERIFY_REPAIR=1\n" + render_verify_script(model_id, cache, revision)
-    verify_result = run_script_on_host(host, verify, ssh_user=ssh_user, ssh_key=ssh_key, ssh_options=ssh_options, timeout=timeout)
+    verify_result = run_script_on_host(host, verify, ssh_kwargs=kw, timeout=timeout, quiet=True)
     if not verify_result.success:
         # rc=1 with no repair output means the cache is absent, not corrupt;
         # the forced ensure below downloads it either way.
         logger.debug("verify(+repair) on %s exited %d; continuing to forced download", host, verify_result.returncode)
 
-    ensure = "export SPARKRUN_FORCE_DOWNLOAD=1\n" + _build_model_ensure_script(model_id, cache, revision=revision, hf_token=hf_token)
-    ensure_result = run_script_on_host(host, ensure, timeout=7200, **kw)
+    ensure = _build_model_ensure_script(model_id, cache, revision=revision, hf_token=hf_token, force_download=True)
+    ensure_result = run_script_on_host(host, ensure, ssh_kwargs=kw, timeout=7200)
     if not ensure_result.success:
         logger.error("forced re-download failed on %s (rc=%d)", host, ensure_result.returncode)
     return ensure_result.success

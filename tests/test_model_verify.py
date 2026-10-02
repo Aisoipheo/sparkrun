@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,45 @@ def test_verify_model_local_missing_cache_is_none(tmp_path):
 def test_verify_model_local_no_weights_is_none(tmp_path):
     cache = _make_cache(tmp_path, weights=False)
     assert verify_model_local("org/name", cache_dir=str(cache), revision="cafe1234") is None
+
+
+def test_verify_model_local_hashes_weights_in_subdirectories(tmp_path):
+    """Recursive scan: repos that shard into a subdirectory verify, not re-download."""
+    hub = tmp_path / "hub" / "models--org--name"
+    snap = hub / "snapshots" / "cafe1234" / "sharded"
+    blobs = hub / "blobs"
+    snap.mkdir(parents=True)
+    blobs.mkdir()
+    data = b"weights"
+    blob = blobs / _sha(data)
+    blob.write_bytes(data)
+    try:
+        (snap / "model-00001-of-000002.safetensors").symlink_to(blob)
+    except OSError:
+        pytest.skip("symlinks unavailable on this filesystem")
+    assert verify_model_local("org/name", cache_dir=str(tmp_path), revision="cafe1234") == []
+
+
+def test_fresh_marker_skips_the_hash_pass(tmp_path):
+    """A clean pass writes a marker; backdated corruption stays invisible until
+    the marker is invalidated — the documented mtime trust model."""
+    import os
+
+    cache = _make_cache(tmp_path)
+    model_cache = cache / "hub" / "models--org--name"
+    assert verify_model_local("org/name", cache_dir=str(cache), revision="cafe1234") == []
+    marker = model_cache / ".sparkrun-verified"
+    assert marker.is_file()
+
+    now = time.time()
+    blob = next((model_cache / "blobs").glob("*"))
+    blob.write_bytes(b"corrupted")
+    os.utime(blob, (now - 100, now - 100))
+    assert verify_model_local("org/name", cache_dir=str(cache), revision="cafe1234") == []
+
+    os.utime(marker, (now - 200, now - 200))
+    bad = verify_model_local("org/name", cache_dir=str(cache), revision="cafe1234")
+    assert bad is not None and len(bad) == 1
 
 
 def test_render_verify_script_has_no_stray_braces():
