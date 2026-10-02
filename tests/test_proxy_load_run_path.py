@@ -88,6 +88,12 @@ def load_env(tmp_path, monkeypatch):
     monkeypatch.setattr("sparkrun.core.launcher.wait_for_serve_ready", readiness)
     monkeypatch.setattr(api.proxy, "register_loaded_model", registration)
     monkeypatch.setattr(api.proxy, "status", status)
+    # Every path here plans, and planning sweeps real occupancy over the
+    # fabricated hosts — mock it so tests measure this file's contract, not
+    # TCP connect timeouts against 10.0.4.x (~21s per test otherwise).
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    monkeypatch.setattr("sparkrun.api.status", lambda *a, **kw: ClusterStatus(hosts=(), executor="docker"))
     return SimpleNamespace(recipe=recipe, calls=calls, order=order, readiness=readiness, registration=registration, status=status)
 
 
