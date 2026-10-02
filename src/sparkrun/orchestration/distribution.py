@@ -1268,10 +1268,12 @@ def _redistribute_after_preflight(
 
     The ladder, per the verified pre-flight results:
 
-    1. local/push: the control machine is the source.  Its own copy is
-       verified first; corrupt blobs are purged and re-downloaded.  When the
-       control machine has no usable copy at all, the head downloads and fans
-       out instead (the control machine is often the tightest on disk).
+    1. local/push: the control machine is the source — that is the mode's
+       whole point (it holds the HF credentials/egress), so the idempotent
+       control-side download runs FIRST (instant on a warm cache, and it is
+       what a cold cache needs before anything can be verified).  The copy is
+       then verified; corrupt blobs are purged and re-downloaded.  Only a
+       control download that actually failed falls back to the head.
     2. delegated (or the local/push fallback): the head is the source.  A
        head copy that failed verification is repaired in place (bad blobs
        removed, forced re-download) before the fan-out, and only the bad
@@ -1286,17 +1288,24 @@ def _redistribute_after_preflight(
     use_head_fanout = transfer_mode == "delegated"
 
     if transfer_mode in ("local", "push"):
-        local_state = verify_model_local(model, local_cache_dir or cache_dir, revision)
-        if local_state is None:
-            logger.info("Control machine has no usable copy of '%s'; falling back to a head download", model)
-            use_head_fanout = True
-        else:
-            if local_state:
+        cache_for_control = local_cache_dir or cache_dir
+        # Control-first: the download is idempotent, so it is both the cold-
+        # cache fetch and the warm-cache no-op, and verification always has
+        # something real to look at.  Rerouting a cold cache to the head here
+        # would break the mode: local/push is chosen precisely because the
+        # control machine holds the HF credentials/egress, and a head without
+        # HF access could not serve the fallback.
+        control_ready = download_model(model, cache_dir=cache_for_control, token=hf_token, revision=revision) == 0
+        if control_ready:
+            local_state = verify_model_local(model, cache_for_control, revision)
+            if local_state is None:
+                control_ready = False
+            elif local_state:
                 for blob in local_state:
                     logger.warning("Purging corrupt blob on the control machine: %s", blob)
                     blob.unlink(missing_ok=True)
-                if download_model(model, cache_dir=local_cache_dir or cache_dir, token=hf_token, revision=revision) != 0:
-                    return [TransferFailure(host=h, reason="control-machine re-download failed") for h in bad]
+                control_ready = download_model(model, cache_dir=cache_for_control, token=hf_token, revision=revision) == 0
+        if control_ready:
             # The control copy now verifies: push only to the hosts that
             # failed the pre-flight.
             return _distribute_single_model(
@@ -1317,6 +1326,8 @@ def _redistribute_after_preflight(
                 # Recursion guard: _preflight_applicable() must not run again.
                 _preflight_done=True,
             )
+        logger.warning("Control machine cannot source '%s'; falling back to a head download", model)
+        use_head_fanout = True
 
     if not use_head_fanout:
         return []

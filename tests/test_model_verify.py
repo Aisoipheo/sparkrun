@@ -171,9 +171,40 @@ def test_only_bad_hosts_receive_the_rsync(monkeypatch, tmp_path):
         tmp_path,
         verify_remote=lambda *a, **k: ["h2"],
         verify_local=[],
+        download=lambda *a, **k: 0,
     )
     assert failures == []
     assert calls == {"from_local": ["h2"]}
+
+
+def test_cold_control_cache_downloads_then_pushes_to_bad_hosts(monkeypatch, tmp_path):
+    """First launch in local mode: the control machine downloads (idempotent),
+    then pushes to the failing hosts — no silent reroute to a head that may
+    lack HF access."""
+    downloads = []
+    failures, calls = _run_ladder(
+        monkeypatch,
+        tmp_path,
+        verify_remote=lambda *a, **k: ["h2"],
+        verify_local=[],
+        download=lambda *a, **k: downloads.append(k) or 0,
+    )
+    assert failures == []
+    assert len(downloads) == 1
+    assert calls == {"from_local": ["h2"]}
+
+
+def test_failed_control_download_falls_back_to_head_fanout(monkeypatch, tmp_path):
+    """The head fallback is reserved for a control download that actually failed."""
+    failures, calls = _run_ladder(
+        monkeypatch,
+        tmp_path,
+        verify_remote=lambda *a, **k: ["h2"],
+        download=lambda *a, **k: 1,
+        mode="local",
+    )
+    assert failures == []
+    assert calls == {"from_head": ["h1", "h2"]}
 
 
 def test_corrupt_control_copy_is_purged_and_re_downloaded(monkeypatch, tmp_path):
@@ -189,18 +220,6 @@ def test_corrupt_control_copy_is_purged_and_re_downloaded(monkeypatch, tmp_path)
     assert failures == []
     assert not corrupt.exists()
     assert calls == {"from_local": ["h2"]}
-
-
-def test_control_without_copy_falls_back_to_head_fanout(monkeypatch, tmp_path):
-    failures, calls = _run_ladder(
-        monkeypatch,
-        tmp_path,
-        verify_remote=lambda *a, **k: ["h2"],
-        verify_local=None,
-        mode="local",
-    )
-    assert failures == []
-    assert calls == {"from_head": ["h1", "h2"]}
 
 
 def test_delegated_repairs_bad_head_before_fanout(monkeypatch, tmp_path):
