@@ -1720,9 +1720,26 @@ def setup_fix_permissions(ctx, hosts, hosts_file, cluster_name, user, cache_dir,
 
     from sparkrun.scripts import read_script
 
-    # --save-sudo: install scoped sudoers entry on each host
+    # The sudo -n script; also the --save-sudo probe below.  A scoped
+    # sudoers rule can only be tested by running the command it whitelists,
+    # and this action is idempotent, so probing is doing the work early.
+    chown_script = read_script("fix_permissions.sh").format(
+        user=user,
+        cache_dir=cache_path or "",
+    )
+
+    # Password-based fallback script (no sudo prefix — run_remote_sudo_script runs as root)
+    fallback_script = read_script("fix_permissions_fallback.sh").format(
+        user=user,
+        cache_dir=cache_path or "",
+    )
+
+    result_map: dict = {}
+    still_failed: list[str] = []
+    sweep_hosts = host_list
+
+    # --save-sudo: install scoped sudoers entry where it is not already effective
     if save_sudo:
-        click.echo("Installing sudoers entry for passwordless chown...")
         from sparkrun.utils.shell import validate_sudoers_path, validate_unix_username
 
         validate_unix_username(user)
@@ -1740,51 +1757,61 @@ def setup_fix_permissions(ctx, hosts, hosts_file, cluster_name, user, cache_dir,
         )
 
         if dry_run:
+            click.echo("Installing sudoers entry for passwordless chown...")
             click.echo("  [dry-run] Would install sudoers entry on %d host(s):" % len(host_list))
             for h in host_list:
                 click.echo("    %s: /etc/sudoers.d/sparkrun-chown-%s" % (h, user))
             click.echo()
         else:
-            sudo_password = click.prompt("[sudo] password for %s" % user, hide_input=True)
-            sudoers_ok, sudoers_fail, sudoers_failed_hosts = install_sudoers_entry(
+            # Probe with the real action: a host that can already do it via
+            # sudo -n needs neither the install nor a password, and its
+            # result carries over so the sweep does not repeat the work.
+            click.echo("Checking passwordless sudo on %d host(s)..." % len(host_list))
+            probe_map, install_targets = run_with_sudo_fallback(
                 host_list,
-                sudoers_script,
-                sudo_password,
-                user,
-                ssh_kwargs=ssh_kwargs,
+                chown_script,
+                fallback_script,
+                ssh_kwargs,
+                dry_run=False,
+                sudo_password=None,
             )
-            click.echo("Sudoers install: %d OK, %d failed." % (sudoers_ok, sudoers_fail))
-            if sudoers_ok:
-                _record_setup_phase(
-                    cluster_name,
+            result_map.update(probe_map)
+            sweep_hosts = install_targets
+            if not install_targets:
+                click.echo("Passwordless sudo already in place on every host; no sudoers install needed.")
+                click.echo()
+            else:
+                click.echo("Installing sudoers entry for passwordless chown on %d host(s)..." % len(install_targets))
+                sudo_password = click.prompt("[sudo] password for %s" % user, hide_input=True)
+                sudoers_ok, sudoers_fail, sudoers_failed_hosts = install_sudoers_entry(
+                    install_targets,
+                    sudoers_script,
+                    sudo_password,
                     user,
-                    host_list,
-                    "sudoers",
-                    files=["/etc/sudoers.d/sparkrun-chown-%s" % user],
+                    ssh_kwargs=ssh_kwargs,
                 )
-            click.echo()
+                click.echo("Sudoers install: %d OK, %d failed." % (sudoers_ok, sudoers_fail))
+                if sudoers_ok:
+                    _record_setup_phase(
+                        cluster_name,
+                        user,
+                        host_list,
+                        "sudoers",
+                        files=["/etc/sudoers.d/sparkrun-chown-%s" % user],
+                    )
+                click.echo()
 
-    # Generate the chown script with sudo -n (non-interactive).
-    chown_script = read_script("fix_permissions.sh").format(
-        user=user,
-        cache_dir=cache_path or "",
-    )
-
-    # Password-based fallback script (no sudo prefix — run_remote_sudo_script runs as root)
-    fallback_script = read_script("fix_permissions_fallback.sh").format(
-        user=user,
-        cache_dir=cache_path or "",
-    )
-
-    # Try non-interactive sudo, then password-based fallback
-    result_map, still_failed = run_with_sudo_fallback(
-        host_list,
-        chown_script,
-        fallback_script,
-        ssh_kwargs,
-        dry_run=dry_run,
-        sudo_password=sudo_password,
-    )
+    # Sweep hosts the probe did not already answer (all of them without --save-sudo)
+    if sweep_hosts:
+        sweep_map, still_failed = run_with_sudo_fallback(
+            sweep_hosts,
+            chown_script,
+            fallback_script,
+            ssh_kwargs,
+            dry_run=dry_run,
+            sudo_password=sudo_password,
+        )
+        result_map.update(sweep_map)
 
     # If hosts failed without a password, prompt and retry
     if still_failed and not dry_run:
@@ -1915,54 +1942,81 @@ def setup_clear_cache(ctx, hosts, hosts_file, cluster_name, user, save_sudo, dry
 
     from sparkrun.scripts import read_script
 
-    # --save-sudo: install scoped sudoers entry on each host
+    # The sudo -n script; also the --save-sudo probe below.  A scoped
+    # sudoers rule can only be tested by running the command it whitelists,
+    # and this action is idempotent, so probing is doing the work early.
+    drop_script = read_script("clear_cache.sh")
+
+    # Password-based fallback script (no sudo — run_remote_sudo_script runs as root)
+    fallback_script = read_script("clear_cache_fallback.sh")
+
+    result_map: dict = {}
+    still_failed: list[str] = []
+    sweep_hosts = host_list
+
+    # --save-sudo: install scoped sudoers entry where it is not already effective
     if save_sudo:
-        click.echo("Installing sudoers entry for passwordless cache clearing...")
         from sparkrun.utils.shell import validate_unix_username
 
         validate_unix_username(user)
         sudoers_script = read_script("clear_cache_sudoers.sh").format(user=user)
 
         if dry_run:
+            click.echo("Installing sudoers entry for passwordless cache clearing...")
             click.echo("  [dry-run] Would install sudoers entry on %d host(s):" % len(host_list))
             for h in host_list:
                 click.echo("    %s: /etc/sudoers.d/sparkrun-dropcaches-%s" % (h, user))
             click.echo()
         else:
-            sudo_password = click.prompt("[sudo] password for %s" % user, hide_input=True)
-            sudoers_ok, sudoers_fail, sudoers_failed_hosts = install_sudoers_entry(
+            # Probe with the real action: a host that can already do it via
+            # sudo -n needs neither the install nor a password, and its
+            # result carries over so the sweep does not repeat the work.
+            click.echo("Checking passwordless sudo on %d host(s)..." % len(host_list))
+            probe_map, install_targets = run_with_sudo_fallback(
                 host_list,
-                sudoers_script,
-                sudo_password,
-                user,
-                ssh_kwargs=ssh_kwargs,
+                drop_script,
+                fallback_script,
+                ssh_kwargs,
+                dry_run=False,
+                sudo_password=None,
             )
-            click.echo("Sudoers install: %d OK, %d failed." % (sudoers_ok, sudoers_fail))
-            if sudoers_ok:
-                _record_setup_phase(
-                    cluster_name,
+            result_map.update(probe_map)
+            sweep_hosts = install_targets
+            if not install_targets:
+                click.echo("Passwordless sudo already in place on every host; no sudoers install needed.")
+                click.echo()
+            else:
+                click.echo("Installing sudoers entry for passwordless cache clearing on %d host(s)..." % len(install_targets))
+                sudo_password = click.prompt("[sudo] password for %s" % user, hide_input=True)
+                sudoers_ok, sudoers_fail, sudoers_failed_hosts = install_sudoers_entry(
+                    install_targets,
+                    sudoers_script,
+                    sudo_password,
                     user,
-                    host_list,
-                    "sudoers",
-                    files=["/etc/sudoers.d/sparkrun-dropcaches-%s" % user],
+                    ssh_kwargs=ssh_kwargs,
                 )
-            click.echo()
+                click.echo("Sudoers install: %d OK, %d failed." % (sudoers_ok, sudoers_fail))
+                if sudoers_ok:
+                    _record_setup_phase(
+                        cluster_name,
+                        user,
+                        host_list,
+                        "sudoers",
+                        files=["/etc/sudoers.d/sparkrun-dropcaches-%s" % user],
+                    )
+                click.echo()
 
-    # Generate the drop_caches script with sudo -n (non-interactive).
-    drop_script = read_script("clear_cache.sh")
-
-    # Password-based fallback script (no sudo — run_remote_sudo_script runs as root)
-    fallback_script = read_script("clear_cache_fallback.sh")
-
-    # Try non-interactive sudo, then password-based fallback
-    result_map, still_failed = run_with_sudo_fallback(
-        host_list,
-        drop_script,
-        fallback_script,
-        ssh_kwargs,
-        dry_run=dry_run,
-        sudo_password=sudo_password,
-    )
+    # Sweep hosts the probe did not already answer (all of them without --save-sudo)
+    if sweep_hosts:
+        sweep_map, still_failed = run_with_sudo_fallback(
+            sweep_hosts,
+            drop_script,
+            fallback_script,
+            ssh_kwargs,
+            dry_run=dry_run,
+            sudo_password=sudo_password,
+        )
+        result_map.update(sweep_map)
 
     # If hosts failed without a password, prompt and retry
     if still_failed and not dry_run:

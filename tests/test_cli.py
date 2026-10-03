@@ -3746,6 +3746,7 @@ class TestSetupFixPermissions:
             stdout="OK: fixed permissions on /home/dgxuser/.cache/huggingface for dgxuser",
             host="10.0.0.1",
         )
+        probe_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
         chown_ok_2 = mock.Mock(
             success=True,
             stdout="OK: fixed permissions on /home/dgxuser/.cache/huggingface for dgxuser",
@@ -3753,10 +3754,13 @@ class TestSetupFixPermissions:
         )
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[chown_ok_1, chown_ok_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[chown_ok_1, probe_fail_2], [chown_ok_2]],
+            ),
             mock.patch(
                 "sparkrun.orchestration.ssh.run_remote_sudo_script",
-                side_effect=[sudoers_ok, install_fail, sudoers_ok],
+                side_effect=[install_fail, sudoers_ok],
             ) as mock_sudo,
         ):
             result = runner.invoke(
@@ -3773,10 +3777,47 @@ class TestSetupFixPermissions:
             assert result.exit_code == 0
             assert "[sudo] password for dgxuser @ 10.0.0.2" in result.output
             assert "Retrying individually" in result.output
-            assert mock_sudo.call_count == 3
-            assert mock_sudo.call_args_list[2][0][2] == "password-two"
-            assert "visudo" in mock_sudo.call_args_list[2][0][1]
-            assert "Sudoers install: 2 OK, 0 failed." in result.output
+            assert mock_sudo.call_count == 2
+            assert mock_sudo.call_args_list[1][0][2] == "password-two"
+            assert "visudo" in mock_sudo.call_args_list[1][0][1]
+            assert "Sudoers install: 1 OK, 0 failed." in result.output
+            assert "2 fixed" in result.output
+
+    def test_save_sudo_skips_install_when_already_configured(self, runner, cluster_setup):
+        """Re-running --save-sudo on a fully configured cluster probes, skips the prompt and the install."""
+        chown_ok_1 = mock.Mock(
+            success=True,
+            stdout="OK: fixed permissions on /home/dgxuser/.cache/huggingface for dgxuser",
+            host="10.0.0.1",
+        )
+        chown_ok_2 = mock.Mock(
+            success=True,
+            stdout="OK: fixed permissions on /home/dgxuser/.cache/huggingface for dgxuser",
+            host="10.0.0.2",
+        )
+
+        with (
+            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[chown_ok_1, chown_ok_2]) as mock_parallel,
+            mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script") as mock_sudo,
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "setup",
+                    "fix-permissions",
+                    "--cluster",
+                    "fix-cluster",
+                    "--save-sudo",
+                ],
+                input="",
+            )
+            assert result.exit_code == 0
+            # The probe ran once; no install targets means no sweep, no prompt
+            assert mock_parallel.call_count == 1
+            mock_sudo.assert_not_called()
+            assert "Passwordless sudo already in place" in result.output
+            assert "Sudoers install:" not in result.output
+            assert "2 fixed" in result.output
 
     def test_fix_permissions_cache_dir_override(self, runner, cluster_setup):
         """Test that --cache-dir is passed through to the chown script."""
@@ -3883,6 +3924,8 @@ class TestSetupFixPermissions:
             stdout="OK: installed sudoers entry in /etc/sudoers.d/sparkrun-chown-dgxuser",
             stderr="",
         )
+        probe_fail_1 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.1")
+        probe_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
         mock_chown_result_1 = mock.Mock(
             success=True,
             stdout="OK: fixed permissions on /home/dgxuser/.cache/huggingface for dgxuser",
@@ -3897,7 +3940,10 @@ class TestSetupFixPermissions:
         )
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[mock_chown_result_1, mock_chown_result_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[probe_fail_1, probe_fail_2], [mock_chown_result_1, mock_chown_result_2]],
+            ),
             mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script", return_value=mock_sudoers_result) as mock_sudo,
         ):
             result = runner.invoke(
@@ -3928,6 +3974,8 @@ class TestSetupFixPermissions:
             stdout="OK: installed sudoers entry in /etc/sudoers.d/sparkrun-chown-dgxuser",
             stderr="",
         )
+        probe_fail_1 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.1")
+        probe_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
         mock_chown_result_1 = mock.Mock(
             success=True,
             stdout="OK: fixed permissions on /home/dgxuser/.cache/huggingface for dgxuser",
@@ -3942,7 +3990,10 @@ class TestSetupFixPermissions:
         )
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[mock_chown_result_1, mock_chown_result_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[probe_fail_1, probe_fail_2], [mock_chown_result_1, mock_chown_result_2]],
+            ),
             mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script", return_value=mock_sudoers_result) as mock_sudo,
         ):
             result = runner.invoke(
@@ -4001,14 +4052,17 @@ class TestSetupFixPermissions:
 
         def sudo_dispatch(host, script, *args, **kwargs):
             sudo_call_count[0] += 1
-            # First 3 calls are sudoers install (incl. the per-host retry),
+            # First 2 calls are sudoers install (incl. the per-host retry),
             # then the chown fallback
-            if sudo_call_count[0] <= 3:
+            if sudo_call_count[0] <= 2:
                 return sudoers_side_effect(host, script, *args, **kwargs)
             return mock_chown_password_ok
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[mock_chown_result_1, mock_chown_fail]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[mock_chown_result_1, mock_chown_fail], [mock_chown_fail]],
+            ),
             mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script", side_effect=sudo_dispatch),
         ):
             result = runner.invoke(
@@ -4208,6 +4262,8 @@ class TestSetupClearCache:
             stdout="OK: installed sudoers entry in /etc/sudoers.d/sparkrun-dropcaches-dgxuser",
             stderr="",
         )
+        probe_fail_1 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.1")
+        probe_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
         mock_drop_result_1 = mock.Mock(
             success=True,
             stdout="OK: page cache cleared",
@@ -4222,7 +4278,10 @@ class TestSetupClearCache:
         )
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[mock_drop_result_1, mock_drop_result_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[probe_fail_1, probe_fail_2], [mock_drop_result_1, mock_drop_result_2]],
+            ),
             mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script", return_value=mock_sudoers_result) as mock_sudo,
         ):
             result = runner.invoke(
@@ -4252,6 +4311,8 @@ class TestSetupClearCache:
             stdout="OK: installed sudoers entry in /etc/sudoers.d/sparkrun-dropcaches-dgxuser",
             stderr="",
         )
+        probe_fail_1 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.1")
+        probe_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
         mock_drop_result_1 = mock.Mock(
             success=True,
             stdout="OK: page cache cleared",
@@ -4266,7 +4327,10 @@ class TestSetupClearCache:
         )
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[mock_drop_result_1, mock_drop_result_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[probe_fail_1, probe_fail_2], [mock_drop_result_1, mock_drop_result_2]],
+            ),
             mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script", return_value=mock_sudoers_result) as mock_sudo,
         ):
             result = runner.invoke(
@@ -4285,6 +4349,71 @@ class TestSetupClearCache:
             # Only the sudoers install calls — no fallback sudo calls for drop_caches
             assert mock_sudo.call_count == 2
 
+    def test_save_sudo_skips_install_when_already_configured(self, runner, cluster_setup):
+        """Re-running --save-sudo on a fully configured cluster probes, skips the prompt and the install."""
+        drop_ok_1 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.1")
+        drop_ok_2 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.2")
+
+        with (
+            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[drop_ok_1, drop_ok_2]) as mock_parallel,
+            mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script") as mock_sudo,
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "setup",
+                    "clear-cache",
+                    "--cluster",
+                    "cache-cluster",
+                    "--save-sudo",
+                ],
+                input="",
+            )
+            assert result.exit_code == 0
+            # The probe ran once; no install targets means no sweep, no prompt
+            assert mock_parallel.call_count == 1
+            mock_sudo.assert_not_called()
+            assert "Passwordless sudo already in place" in result.output
+            assert "Sudoers install:" not in result.output
+            assert "2 cleared" in result.output
+
+    def test_save_sudo_installs_only_where_needed(self, runner, cluster_setup):
+        """Probe passes on a configured host (no install, no prompt for it) and installs only on the rest."""
+        sudoers_ok = mock.Mock(
+            success=True,
+            stdout="OK: installed sudoers entry in /etc/sudoers.d/sparkrun-dropcaches-dgxuser",
+            stderr="",
+        )
+        drop_ok_1 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.1")
+        drop_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
+        drop_ok_2 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.2")
+
+        with (
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[drop_ok_1, drop_fail_2], [drop_ok_2]],
+            ),
+            mock.patch("sparkrun.orchestration.ssh.run_remote_sudo_script", return_value=sudoers_ok) as mock_sudo,
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "setup",
+                    "clear-cache",
+                    "--cluster",
+                    "cache-cluster",
+                    "--save-sudo",
+                ],
+                input="sudopassword\n",
+            )
+            assert result.exit_code == 0
+            # Only the host the probe flagged gets the install
+            assert mock_sudo.call_count == 1
+            assert mock_sudo.call_args_list[0][0][0] == "10.0.0.2"
+            assert mock_sudo.call_args_list[0][0][2] == "sudopassword"
+            assert "Sudoers install: 1 OK, 0 failed." in result.output
+            assert "2 cleared" in result.output
+
     def test_save_sudo_mixed_passwords(self, runner, cluster_setup):
         """Hosts with different sudo passwords are each prompted individually for the sudoers install."""
         sudoers_ok = mock.Mock(
@@ -4294,13 +4423,17 @@ class TestSetupClearCache:
         )
         install_fail = mock.Mock(success=False, stdout="", stderr="sudo: 3 incorrect password attempts")
         drop_ok_1 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.1")
+        probe_fail_2 = mock.Mock(success=False, stdout="", stderr="sudo: a password is required", host="10.0.0.2")
         drop_ok_2 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.2")
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[drop_ok_1, drop_ok_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[drop_ok_1, probe_fail_2], [drop_ok_2]],
+            ),
             mock.patch(
                 "sparkrun.orchestration.ssh.run_remote_sudo_script",
-                side_effect=[sudoers_ok, install_fail, sudoers_ok],
+                side_effect=[install_fail, sudoers_ok],
             ) as mock_sudo,
         ):
             result = runner.invoke(
@@ -4318,12 +4451,12 @@ class TestSetupClearCache:
             # One cluster-wide prompt, then a per-host prompt for the failed host
             assert "[sudo] password for dgxuser @ 10.0.0.2" in result.output
             assert "Retrying individually" in result.output
-            assert mock_sudo.call_count == 3
+            assert mock_sudo.call_count == 2
             # The retry used the per-host password, not the cluster-wide one
-            assert mock_sudo.call_args_list[2][0][0] == "10.0.0.2"
-            assert mock_sudo.call_args_list[2][0][2] == "password-two"
-            assert "visudo" in mock_sudo.call_args_list[2][0][1]
-            assert "Sudoers install: 2 OK, 0 failed." in result.output
+            assert mock_sudo.call_args_list[1][0][0] == "10.0.0.2"
+            assert mock_sudo.call_args_list[1][0][2] == "password-two"
+            assert "visudo" in mock_sudo.call_args_list[1][0][1]
+            assert "Sudoers install: 1 OK, 0 failed." in result.output
             assert "2 cleared" in result.output
 
     def test_save_sudo_converges_on_clear_retry_password(self, runner, cluster_setup):
@@ -4339,10 +4472,13 @@ class TestSetupClearCache:
         drop_ok_2 = mock.Mock(success=True, stdout="OK: page cache cleared", host="10.0.0.2")
 
         with (
-            mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[drop_ok_1, drop_fail_2]),
+            mock.patch(
+                "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+                side_effect=[[drop_ok_1, drop_fail_2], [drop_fail_2]],
+            ),
             mock.patch(
                 "sparkrun.orchestration.ssh.run_remote_sudo_script",
-                side_effect=[sudoers_ok, auth_fail, auth_fail, auth_fail, drop_ok_2, sudoers_ok],
+                side_effect=[auth_fail, auth_fail, auth_fail, drop_ok_2, sudoers_ok],
             ) as mock_sudo,
         ):
             result = runner.invoke(
@@ -4361,11 +4497,11 @@ class TestSetupClearCache:
             # The install failed on 10.0.0.2 even after its own retry; the
             # clear's per-host retry proved the right password, and the
             # sudoers entry is installed with it before the command ends.
-            assert mock_sudo.call_count == 6
+            assert mock_sudo.call_count == 5
+            assert mock_sudo.call_args_list[3][0][2] == "password-two"
+            assert "drop_caches" in mock_sudo.call_args_list[3][0][1]
             assert mock_sudo.call_args_list[4][0][2] == "password-two"
-            assert "drop_caches" in mock_sudo.call_args_list[4][0][1]
-            assert mock_sudo.call_args_list[5][0][2] == "password-two"
-            assert "visudo" in mock_sudo.call_args_list[5][0][1]
+            assert "visudo" in mock_sudo.call_args_list[4][0][1]
             assert "installed sudoers entry" in result.output
 
 
